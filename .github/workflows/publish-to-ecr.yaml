@@ -17,22 +17,38 @@ jobs:
       WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4 # v3 -> v4 (最新推奨)
 
       - name: Set up Node.js
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4 # v3 -> v4 (最新推奨)
         with:
           node-version: '22'
+          cache: 'npm' # キャッシュを追加して高速化
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci # npm install より CI 環境に適した npm ci を推奨
 
       - name: Run Gulp build
+        # Node 22 の ESM 互換性のためのオプションを追加
+        env:
+          NODE_OPTIONS: "--experimental-require-module" 
         run: npm run build
 
-      - name: Build and push latest Docker image
+      - name: Configure AWS credentials
+        # ECR ログインより前に実行する必要があります（build 中に ECR を参照しない場合でも、認証順序として推奨）
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/my-github-actions-role
+          aws-region: us-east-1
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build Docker image
         env:
-          REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
+          # registry は login-ecr の出力を使うのが確実です
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           REPOSITORY: "prime-website"
           COMMIT_SHA: ${{ github.sha }}
         run: |
@@ -49,46 +65,21 @@ jobs:
 
       - name: Run Wiz CLI image scan
         id: scan
-        run: ./wizcli docker scan -i $REGISTRY/$REPOSITORY:${COMMIT_SHA} --policy ${ODLUSER}-vuln-block
-        continue-on-error: false
         env:
-          REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           REPOSITORY: "prime-website"
           COMMIT_SHA: ${{ github.sha }}
           ODLUSER: ${{ secrets.ODLUSER }}
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v3
-        with:
-          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/my-github-actions-role
-          aws-region: us-east-1
-
-      - name: Login to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
-        with:
-          registry: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
+        run: ./wizcli docker scan -i $REGISTRY/$REPOSITORY:${COMMIT_SHA} --policy ${ODLUSER}-vuln-block
 
       - name: Push the tagged Docker image to Amazon ECR
         env:
-          REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           REPOSITORY: "prime-website"
           COMMIT_SHA: ${{ github.sha }}
         run: |
-          cd dist
           IMAGE_TAG=$REGISTRY/$REPOSITORY:${COMMIT_SHA}
           docker push $IMAGE_TAG
-
-      - name: Verify Docker image
-        env:
-          REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
-          REPOSITORY: "prime-website"
-          COMMIT_SHA: ${{ github.sha }}
-        run: |
-          REPOSITORY_URI=$REGISTRY/$REPOSITORY
-          IMAGE_TAG=$REPOSITORY_URI:${COMMIT_SHA}
-          echo "Pulling Docker image with URI: $IMAGE_TAG"
-          docker pull $IMAGE_TAG
 
       - name: Trigger AWS App Runner
         env:
@@ -96,17 +87,16 @@ jobs:
           SERVICE_ARN: ${{ secrets.APP_RUNNER_SERVICE_ARN }}
           REPOSITORY: "prime-website"
           COMMIT_SHA: ${{ github.sha }}
-          ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         run: |
-          IMAGE_URI=$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPOSITORY:$COMMIT_SHA
+          IMAGE_URI=$REGISTRY/$REPOSITORY:$COMMIT_SHA
           aws apprunner update-service --service-arn $SERVICE_ARN --source-configuration "ImageRepository={ImageIdentifier=\"$IMAGE_URI\",ImageRepositoryType=\"ECR\"}"
 
       - name: Run Wiz CLI image tag
         env:
-          ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
-          AWS_REGION: "us-east-1"
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           REPOSITORY: "prime-website"
           COMMIT_SHA: ${{ github.sha }}
         run: |
-          IMAGE_URI=$ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/$REPOSITORY:$COMMIT_SHA
-          ./wizcli docker tag -i $IMAGE_UR
+          IMAGE_URI=$REGISTRY/$REPOSITORY:$COMMIT_SHA
+          ./wizcli docker tag -i $IMAGE_URI 
